@@ -122,13 +122,12 @@ class CompositionCog(commands.Cog):
             # Ставим обновление в очередь для пакетной обработки
             self.update_queue[after.guild.id].add(after.id)
 
-    # --- Команды ---
+    # --- Слеш команды ---
     @app_commands.command(name="создатьсписоксостава", description="Создает новый список для отслеживания состава.")
     @app_commands.default_permissions(administrator=True)
     async def create_list(self, interaction: discord.Interaction, title: str, roles: str):
-        # Оборачиваем в try-except, чтобы наш центральный обработчик ловил ошибки
         try:
-            await interaction.response.defer(ephemeral=True) # Отвечаем сразу, но скрыто
+            await interaction.response.defer(ephemeral=True)
 
             role_ids = re.findall(r'<@&(\d+)>', roles)
             if not role_ids or len(role_ids) != len(set(role_ids)):
@@ -148,10 +147,10 @@ class CompositionCog(commands.Cog):
             # Создаем "пустое" сообщение, чтобы получить ID
             message = await interaction.channel.send("Создание списка...")
 
-            # ИЗМЕНЕНИЕ 1: Сохраняем запись в БД и получаем её ID
+            # Сохраняем запись в БД и получаем её ID
             new_list_id = db_manager.add_list(message.id, interaction.channel_id, interaction.guild_id, title, sections)
             
-            # ИЗМЕНЕНИЕ 2: Используем ID, чтобы получить свежий, "живой" объект из БД
+            # Используем ID, чтобы получить свежий, "живой" объект из БД
             db_list = db_manager.get_list(new_list_id)
 
             # Теперь db_list привязан к новой сессии и с ним можно безопасно работать
@@ -161,9 +160,211 @@ class CompositionCog(commands.Cog):
 
         except Exception as e:
             await BotErrorHandler.handle(e, "создатьсписоксостава", interaction)
-    
-    # ... Другие команды (удалить, показать) и контекстные меню можно добавить сюда по аналогии ...
+
+    @app_commands.command(name="удалитьсписоксостава", description="Удаляет список состава по ID сообщения.")
+    @app_commands.default_permissions(administrator=True)
+    async def delete_list(self, interaction: discord.Interaction, message_id: str):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            # Проверяем, что ID является числом
+            try:
+                msg_id = int(message_id)
+            except ValueError:
+                await interaction.followup.send("Ошибка: ID сообщения должен быть числом.", ephemeral=True)
+                return
+            
+            # Проверяем существование списка
+            db_list = db_manager.get_list(msg_id)
+            if not db_list:
+                await interaction.followup.send("Ошибка: Список с таким ID не найден.", ephemeral=True)
+                return
+            
+            # Проверяем, что список принадлежит этому серверу
+            if db_list.guild_id != interaction.guild_id:
+                await interaction.followup.send("Ошибка: Этот список не принадлежит данному серверу.", ephemeral=True)
+                return
+            
+            # Удаляем сообщение из Discord
+            try:
+                channel = await self.bot.fetch_channel(db_list.channel_id)
+                message = await channel.fetch_message(msg_id)
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                # Сообщение уже удалено или нет прав - это нормально
+                pass
+            
+            # Удаляем из базы данных
+            if db_manager.delete_list(msg_id):
+                await interaction.followup.send(f"Список '{db_list.title}' успешно удален.", ephemeral=True)
+            else:
+                await interaction.followup.send("Ошибка при удалении списка из базы данных.", ephemeral=True)
+
+        except Exception as e:
+            await BotErrorHandler.handle(e, "удалитьсписоксостава", interaction)
+
+    @app_commands.command(name="показатьсписки", description="Показывает все списки состава на сервере.")
+    @app_commands.default_permissions(administrator=True)
+    async def show_lists(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            all_lists = db_manager.get_lists_for_guild(interaction.guild_id)
+            
+            if not all_lists:
+                await interaction.followup.send("На этом сервере нет активных списков состава.", ephemeral=True)
+                return
+            
+            embed = discord.Embed(
+                title="📋 Списки состава на сервере",
+                color=discord.Color.blue()
+            )
+            
+            for db_list in all_lists:
+                channel = self.bot.get_channel(db_list.channel_id)
+                channel_name = channel.name if channel else "❌ Канал удален"
+                
+                embed.add_field(
+                    name=f"📝 {db_list.title}",
+                    value=f"**ID:** `{db_list.message_id}`\n"
+                          f"**Канал:** #{channel_name}\n"
+                          f"**Создан:** {db_list.created_at.strftime('%d.%m.%Y %H:%M') if db_list.created_at else 'Неизвестно'}",
+                    inline=False
+                )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            await BotErrorHandler.handle(e, "показатьсписки", interaction)
+
+
+
+
+# --- Вспомогательный класс для подтверждения удаления ---
+class DeleteConfirmView(discord.ui.View):
+    def __init__(self, message_id: int, list_title: str):
+        super().__init__(timeout=30.0)
+        self.message_id = message_id
+        self.list_title = list_title
+
+    @discord.ui.button(label='Да, удалить', style=discord.ButtonStyle.danger, emoji='🗑️')
+    async def confirm_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            # Удаляем сообщение из Discord
+            try:
+                message = await interaction.channel.fetch_message(self.message_id)
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                # Сообщение уже удалено или нет прав - это нормально
+                pass
+            
+            # Удаляем из базы данных
+            if db_manager.delete_list(self.message_id):
+                embed = discord.Embed(
+                    title="✅ Список удален",
+                    description=f"Список **'{self.list_title}'** успешно удален.",
+                    color=discord.Color.green()
+                )
+                await interaction.response.edit_message(embed=embed, view=None)
+            else:
+                await interaction.response.send_message("Ошибка при удалении списка из базы данных.", ephemeral=True)
+                
+        except Exception as e:
+            await BotErrorHandler.handle(e, "confirm_delete", interaction)
+
+    @discord.ui.button(label='Отмена', style=discord.ButtonStyle.secondary, emoji='❌')
+    async def cancel_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="❌ Удаление отменено",
+            description="Список остался без изменений.",
+            color=discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def on_timeout(self):
+        # Убираем кнопки по истечении времени
+        for item in self.children:
+            item.disabled = True
+
+
+# --- Контекстные меню (определяются вне класса) ---
+@app_commands.context_menu(name="Удалить список состава")
+@app_commands.default_permissions(administrator=True)
+async def delete_list_context(interaction: discord.Interaction, message: discord.Message):
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Проверяем, является ли это сообщение списком состава
+        db_list = db_manager.get_list(message.id)
+        if not db_list:
+            await interaction.followup.send("Это сообщение не является списком состава.", ephemeral=True)
+            return
+        
+        # Проверяем права (список должен быть на этом сервере)
+        if db_list.guild_id != interaction.guild_id:
+            await interaction.followup.send("Ошибка: Этот список не принадлежит данному серверу.", ephemeral=True)
+            return
+        
+        # Создаем подтверждающее embed
+        embed = discord.Embed(
+            title="⚠️ Подтверждение удаления",
+            description=f"Вы действительно хотите удалить список **'{db_list.title}'**?",
+            color=discord.Color.red()
+        )
+        
+        # Создаем кнопки подтверждения
+        view = DeleteConfirmView(db_list.message_id, db_list.title)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    except Exception as e:
+        await BotErrorHandler.handle(e, "delete_list_context", interaction)
+
+@app_commands.context_menu(name="Информация о списке")
+@app_commands.default_permissions(administrator=True)
+async def list_info_context(interaction: discord.Interaction, message: discord.Message):
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Проверяем, является ли это сообщение списком состава
+        db_list = db_manager.get_list(message.id)
+        if not db_list:
+            await interaction.followup.send("Это сообщение не является списком состава.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"📋 Информация о списке",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(name="Название", value=db_list.title, inline=False)
+        embed.add_field(name="ID сообщения", value=f"`{db_list.message_id}`", inline=True)
+        embed.add_field(name="ID канала", value=f"`{db_list.channel_id}`", inline=True)
+        embed.add_field(name="Создан", value=db_list.created_at.strftime('%d.%m.%Y %H:%M') if db_list.created_at else 'Неизвестно', inline=True)
+        embed.add_field(name="Обновлен", value=db_list.updated_at.strftime('%d.%m.%Y %H:%M') if db_list.updated_at else 'Неизвестно', inline=True)
+        
+        # Информация о отслеживаемых ролях
+        roles_info = []
+        for role_id, section_data in db_list.sections.items():
+            role = interaction.guild.get_role(int(role_id))
+            status = "✅" if role else "❌"
+            roles_info.append(f"{status} {section_data['role_name']} (`{role_id}`)")
+        
+        embed.add_field(
+            name="Отслеживаемые роли",
+            value="\n".join(roles_info) if roles_info else "Нет ролей",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        await BotErrorHandler.handle(e, "list_info_context", interaction)
 
 
 async def setup(bot: commands.Bot):
+    # Добавляем Cog
     await bot.add_cog(CompositionCog(bot))
+    
+    # Добавляем контекстные меню
+    bot.tree.add_command(delete_list_context)
+    bot.tree.add_command(list_info_context)
