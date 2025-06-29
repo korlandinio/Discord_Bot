@@ -60,8 +60,20 @@ class CompositionCog(commands.Cog):
             if not all_lists:
                 continue
             
-            # Получаем объекты участников одним запросом (если возможно)
-            members = {m.id: m for m in await guild.fetch_members(limit=None).flatten() if m.id in member_ids}
+            # Получаем объекты участников - исправленный код
+            members = {}
+            try:
+                # Используем async for для итерации по async generator
+                async for member in guild.fetch_members(limit=None):
+                    if member.id in member_ids:
+                        members[member.id] = member
+            except discord.Forbidden:
+                # Если нет прав на получение участников, используем кеш
+                members = {m.id: m for m in guild.members if m.id in member_ids}
+            except Exception as e:
+                # В случае других ошибок логируем и пропускаем
+                print(f"Ошибка при получении участников для гильдии {guild_id}: {e}")
+                continue
             
             for db_list in all_lists:
                 updated = False
